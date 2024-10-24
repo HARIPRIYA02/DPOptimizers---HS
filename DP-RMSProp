@@ -1,0 +1,220 @@
+import warnings
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torchvision.datasets import CIFAR10
+import torch.nn as nn
+import torch.optim as optim
+from opacus import PrivacyEngine
+from opacus.utils.batch_memory_manager import BatchMemoryManager
+from torchvision.transforms.functional import InterpolationMode
+from opacus.validators import ModuleValidator
+from tqdm import tqdm
+import numpy as np
+import argparse
+
+warnings.simplefilter("ignore")
+
+# Hyperparameters
+MAX_GRAD_NORM = 1.2
+EPSILON = 3.0
+DELTA = 1e-5
+NOISE_MULTIPLIER = 1.0
+EPOCHS = 25
+LR = 1e-3
+BATCH_SIZE = 256
+MAX_PHYSICAL_BATCH_SIZE = 256
+CIFAR10_MEAN = [0.5]
+CIFAR10_STD_DEV = [0.5]
+SEVERITY=3
+WIDTH=3
+DEPTH=-1
+ALPHA=1.0
+bound=0.1
+NUM_GROUPS=4
+transform = transforms.Compose([
+
+    
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),  # Apply color jitter
+    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),  # Apply Gaussian blur
+    transforms.AugMix(severity=3, mixture_width=3, chain_depth=-1, alpha=1.0, all_ops=False,
+                      interpolation=InterpolationMode.BILINEAR),  # Apply AugMix augmentation
+    transforms.ToTensor(),
+    transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD_DEV)
+
+])
+
+    # Load datasets
+DATA_ROOT = "~/.local/data"
+train_dataset = CIFAR10(root=DATA_ROOT, train=True, download=True, transform=transform)
+test_dataset = CIFAR10(root=DATA_ROOT, train=False, download=True, transform=transform)
+
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+# Define ResNet-20 with Group Normalization
+class BasicBlockGN(nn.Module):
+    def __init__(self, in_planes, planes, stride=1, num_groups=2):
+        super(BasicBlockGN, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.gn1 = nn.GroupNorm(num_groups, planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.gn2 = nn.GroupNorm(num_groups, planes)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.GroupNorm(num_groups, planes)
+            )
+
+    def forward(self, x):
+        out = nn.ReLU()(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = nn.ReLU()(out)
+        return out
+
+class ResNet20GN(nn.Module):
+    def __init__(self, num_classes=10, num_groups=2):
+        super(ResNet20GN, self).__init__()
+        self.in_planes = 16
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.gn1 = nn.GroupNorm(num_groups, 16)
+        self.layer1 = self._make_layer(BasicBlockGN, 16, 3, stride=1, num_groups=num_groups)
+        self.layer2 = self._make_layer(BasicBlockGN, 32, 3, stride=2, num_groups=num_groups)
+        self.layer3 = self._make_layer(BasicBlockGN, 64, 3, stride=2, num_groups=num_groups)
+        self.linear = nn.Linear(64, num_classes)
+
+    def _make_layer(self, block, planes, num_blocks, stride, num_groups):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride, num_groups))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = nn.ReLU()(self.gn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = nn.AvgPool2d(8)(out)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+
+    # Transformations for AugMix, grayscale, normalization, and standardization
+
+model = ResNet20GN(num_classes=10)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = ModuleValidator.fix(model)
+model = model.to(device)
+optimizer = optim.RMSprop(model.parameters(), lr=LR)
+ModuleValidator.validate(model, strict=False)
+noise_generators = torch.Generator(device=device)
+privacy_engine = PrivacyEngine()
+model, optimizer, train_loader = privacy_engine.make_private_with_epsilon(
+            module=model,
+            optimizer=optimizer,
+            data_loader=train_loader,
+            epochs=EPOCHS,
+            target_epsilon=EPSILON,
+            target_delta=DELTA,
+            max_grad_norm=MAX_GRAD_NORM,
+            noise_generator=noise_generators
+        )
+
+    # Adaptive learning rate scheduler
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS*len(train_loader), eta_min=1e-6)
+
+    # Loss function
+criterion = nn.CrossEntropyLoss()
+
+# Grouped Gradient Clipping Function
+def GroupedGradClip(gradients, bound, groups):
+    # Flatten gradients before splitting
+    flat_grad = gradients.view(gradients.size(0), -1)  # Flatten to process gradients as a 2D tensor
+    grouped_grads = torch.chunk(flat_grad, groups, dim=1)  # Chunk along the feature dimension
+    clipped_grads = []
+
+    # Compute the norm for each group and clip
+    for g in grouped_grads:
+        grad_norm = torch.norm(g, dim=1, keepdim=True)
+        clip_coef = torch.clamp(bound / (grad_norm + 1e-6), max=1.0)  # Clip the gradient norm
+        clipped_grads.append(g * clip_coef)
+
+    # Concatenate back the clipped gradients and reshape to original
+    clipped_flat_grad = torch.cat(clipped_grads, dim=1)
+    
+    # Reshape back to original gradient shape
+    return clipped_flat_grad.view_as(gradients)
+
+
+# Modify the training loop to include Grouped Gradient Clipping
+def train(model, train_loader, optimizer, epoch, device):
+    model.train()
+    losses = []
+    top1_acc = []
+
+    with BatchMemoryManager(data_loader=train_loader, max_physical_batch_size=MAX_PHYSICAL_BATCH_SIZE, optimizer=optimizer) as memory_safe_data_loader:
+        for batch_idx, (data, target) in tqdm(enumerate(memory_safe_data_loader), total=len(memory_safe_data_loader)):
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+
+            # Apply grouped gradient clipping
+            for p in model.parameters():
+                  if p.grad is not None:
+                      p.grad = GroupedGradClip(p.grad, bound, NUM_GROUPS)
+       
+
+            optimizer.step()
+            losses.append(loss.item())
+            _, predicted = torch.max(output.data, 1)
+            correct = predicted.eq(target).sum().item()
+            top1_acc.append(correct / target.size(0))
+            if (batch_idx + 1) % 200 == 0:
+                epsilon = privacy_engine.get_epsilon(DELTA)
+                print(
+                    f"(ε = {epsilon:.2f}, δ = {DELTA})"
+                )
+
+    avg_loss = np.mean(losses)
+    avg_acc = np.mean(top1_acc) * 100
+    return avg_loss, avg_acc,epsilon
+
+# Validate on the test set
+def test(model, test_loader, device):
+    model.eval()
+    test_loss = 0
+    correct = 0
+
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            test_loss += criterion(output, target).item()  # Sum the batch loss
+            pred = output.argmax(dim=1, keepdim=True)  # Get the index of the max log-probability
+            correct += pred.eq(target.view_as(pred)).sum().item()
+
+    test_loss /= len(test_loader.dataset)
+    accuracy = 100. * correct / len(test_loader.dataset)
+    return test_loss, correct, len(test_loader.dataset), accuracy
+
+# Train the model and validate on the test set
+for epoch in range(1, EPOCHS + 1):
+    train_loss, train_acc,epsilonv = train(model, train_loader, optimizer, epoch, device)
+    test_loss, correct, test_size, test_accuracy = test(model, test_loader, device)
+    print(f'Epoch: {epoch}, Train Loss: {train_loss:.4f}, Train Accuracy: {train_acc:.2f}%, '
+          f'Test Loss: {test_loss:.4f}, Test Accuracy: {correct}/{test_size} ({test_accuracy:.2f}%), '
+    f'Epsilon: {epsilonv:.2f}')
+
+    scheduler.step()
+
+# Print final epsilon after training
+final_epsilon = privacy_engine.get_epsilon(DELTA)
+print(f"Final epsilon after {EPOCHS} epochs: {final_epsilon:.2f}")
+
