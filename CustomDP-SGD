@@ -98,7 +98,7 @@ batch_size = 512
 learning_rate = 0.01
 num_epochs = 25
 delta = 1e-5
-epsilon = 5.0  # Target privacy budget
+epsilon = 3.0  # Target privacy budget
 augmentation_multiplicity = 4  # Number of augmentations per image
 # Define the initial noise multiplier and decay factor
 initial_noise_multiplier = 1.0
