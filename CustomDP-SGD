@@ -1,0 +1,267 @@
+import torch
+import torch.optim as optim
+import torch.nn as nn
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from opacus import PrivacyEngine
+import copy
+import numpy as np  # For percentile calculation
+import torchvision.transforms.functional as TF
+import random
+
+class Cutout(object):
+    def __init__(self, mask_size, p=0.5):
+        self.mask_size = mask_size  # Size of the mask square
+        self.p = p  # Probability of applying Cutout
+
+    def __call__(self, img):
+        if random.uniform(0, 1) > self.p:
+            return img  # No Cutout
+
+        # Get the image dimensions
+        _, h, w = img.shape
+        mask_size_half = self.mask_size // 2
+
+        # Randomly choose the center of the cutout mask
+        cx = np.random.randint(mask_size_half, w - mask_size_half)
+        cy = np.random.randint(mask_size_half, h - mask_size_half)
+
+        # Apply the cutout mask
+        x1 = np.clip(cx - mask_size_half, 0, w)
+        x2 = np.clip(cx + mask_size_half, 0, w)
+        y1 = np.clip(cy - mask_size_half, 0, h)
+        y2 = np.clip(cy + mask_size_half, 0, h)
+
+        img[:, y1:y2, x1:x2] = 0  # Set the cutout area to zero (blackout)
+        return img
+
+# Define the ResNet-20 architecture with GroupNorm and Weight Standardization
+class ResNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ResNetBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(num_groups=2, num_channels=out_channels)  # Use GroupNorm
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(num_groups=2, num_channels=out_channels)  # Use GroupNorm
+        nn.init.xavier_uniform_(self.conv1.weight)  # Weight standardization
+        nn.init.xavier_uniform_(self.conv2.weight)  # Weight standardization
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out += identity
+        out = self.relu(out)
+        return out
+
+class ResNet(nn.Module):
+    def __init__(self, block, num_blocks, num_classes=10):
+        super(ResNet, self).__init__()
+        self.in_channels = 16
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(num_groups=2, num_channels=16)  # Use GroupNorm
+        self.relu = nn.ReLU(inplace=True)
+        self.layers = self._make_layers(block, num_blocks)
+        self.fc = nn.Linear(16, num_classes)
+
+    def _make_layers(self, block, num_blocks):
+        layers = []
+        for i in range(len(num_blocks)):
+            layers.append(block(self.in_channels, 16))
+            self.in_channels = 16
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.relu(out)
+        out = self.layers(out)
+        out = out.mean(dim=[2, 3])  # Global Average Pooling
+        out = self.fc(out)
+        return out
+# Function to update noise multiplier
+def adjust_noise_multiplier(epoch, current_noise_multiplier, validation_loss):
+    # Exponential decay or loss-based reduction
+    if epoch > 0 and epoch % 2 == 0:  # Adjust every 2 epochs as an example
+        new_noise_multiplier = max(min_noise_multiplier, current_noise_multiplier * decay_rate)
+    else:
+        new_noise_multiplier = current_noise_multiplier
+    return new_noise_multiplier
+# Hyperparameters
+batch_size = 512
+learning_rate = 0.01
+num_epochs = 25
+delta = 1e-5
+epsilon = 5.0  # Target privacy budget
+augmentation_multiplicity = 4  # Number of augmentations per image
+# Define the initial noise multiplier and decay factor
+initial_noise_multiplier = 1.0
+min_noise_multiplier = 0.1  # Minimum noise level to maintain privacy
+decay_rate = 0.9  # Factor by which noise decreases
+
+# Define the data augmentation pipeline with Cutout and Random Erasing
+mask_size = 16  # Define mask size for Cutout
+
+base_transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomCrop(32, padding=4),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    Cutout(mask_size=mask_size, p=0.5),  # Custom Cutout with a 50% probability
+    transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0)  # Random Erasing
+])
+
+# CIFAR-10 dataset and dataloaders with the new transform
+train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=base_transform)
+test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=base_transform)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+
+
+# Define the device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Initialize the model, loss function, optimizer, and learning rate scheduler
+model = ResNet(ResNetBlock, [3, 3, 3]).to(device)  # Modify for your ResNet-20 structure
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=5e-4)
+
+# Use the ReduceLROnPlateau scheduler to reduce LR when validation loss plateaus
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+
+# Make model private with Opacus' PrivacyEngine
+privacy_engine = PrivacyEngine()
+model, optimizer, train_loader = privacy_engine.make_private(
+    module=model,
+    optimizer=optimizer,
+    data_loader=train_loader,
+    noise_multiplier=initial_noise_multiplier,
+    max_grad_norm=1.0
+)
+
+# Define parameter groups for grouped gradient clipping
+parameter_groups = [
+    {'params': [p for n, p in model.named_parameters() if 'conv' in n], 'max_grad_norm': 1.5},
+    {'params': [p for n, p in model.named_parameters() if 'fc' in n], 'max_grad_norm': 1.0}
+]
+
+# Function for grouped gradient clipping
+def grouped_clip_gradients(groups, percentile=95):
+    for group in groups:
+        params = group['params']
+        max_grad_norm = group['max_grad_norm']
+        all_norms = [p.grad.norm().item() for p in params if p.grad is not None]
+        if len(all_norms) > 0:
+            threshold = np.percentile(all_norms, percentile)
+            for p in params:
+                if p.grad is not None:
+                    p.grad.data = p.grad.data * (max_grad_norm / max(p.grad.norm(), threshold))
+
+# Training function with grouped gradient clipping and augmentation multiplicity
+def train(model, loader, criterion, optimizer, augmentation_multiplicity):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    augmentation = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4)
+    ])
+
+    for inputs, targets in loader:
+        augmented_grads = None
+        inputs, targets = inputs.to(device), targets.to(device)
+
+        for i in range(augmentation_multiplicity):
+            aug_inputs = torch.stack([augmentation(img) for img in inputs])  # Augment each input
+            aug_inputs = aug_inputs.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(aug_inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+
+            # Accumulate gradients for averaging
+            if augmented_grads is None:
+                augmented_grads = [param.grad.clone() for param in model.parameters()]
+            else:
+                for j, param in enumerate(model.parameters()):
+                    augmented_grads[j] += param.grad
+
+        # Average the gradients across augmentations
+        for j, param in enumerate(model.parameters()):
+            param.grad = augmented_grads[j] / augmentation_multiplicity
+
+        # Apply grouped gradient clipping
+        grouped_clip_gradients(parameter_groups, percentile=95)
+
+        # Step optimizer
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+
+    epoch_loss = running_loss / len(loader.dataset)
+    accuracy = 100. * correct / total
+    return epoch_loss, accuracy
+
+# Testing function remains the same
+def test(model, loader, criterion):
+    model.eval()
+    test_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+            test_loss += loss.item() * inputs.size(0)
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+    epoch_loss = test_loss / len(loader.dataset)
+    accuracy = 100. * correct / total
+    return epoch_loss, accuracy
+
+# Training loop with dynamic noise adjustment
+current_noise_multiplier = initial_noise_multiplier
+# Training loop with differential privacy, grouped gradient clipping, and dynamic learning rate
+test_loss = float('inf')  # Initialize with a high value
+for epoch in range(num_epochs):
+  # Adjust noise multiplier based on the current epoch and validation performance
+    current_noise_multiplier = adjust_noise_multiplier(epoch, current_noise_multiplier, test_loss)
+    # Update the PrivacyEngine's noise multiplier dynamically
+    privacy_engine.noise_multiplier = current_noise_multiplier
+
+    # Training and testing
+    train_loss, train_accuracy = train(model, train_loader, criterion, optimizer, augmentation_multiplicity)
+    test_loss, test_accuracy = test(model, test_loader, criterion)
+
+    # Get privacy budget after each epoch
+    epsilon_spent = privacy_engine.get_epsilon(delta)
+
+    print(f"Epoch [{epoch+1}/{num_epochs}], "
+          f"Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.2f}% "
+          f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.2f}% "
+          f"(ε = {epsilon_spent:.2f}, δ = {delta}, Noise Multiplier = {current_noise_multiplier:.2f})")
+
+    # Adjust learning rate based on validation loss (test_loss in this case)
+    scheduler.step(test_loss)
+
+print("Training complete.")
